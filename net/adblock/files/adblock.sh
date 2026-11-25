@@ -58,6 +58,8 @@ adb_pidfile="${adb_rundir}/adblock.pid"
 adb_rtfile="${adb_rundir}/adblock.runtime.json"
 adb_etaglock="${adb_rundir}/adblock.etag.lock"
 adb_allowlist="/etc/adblock/adblock.allowlist"
+adb_allowurl=""
+adb_allowkeys=""
 adb_blocklist="/etc/adblock/adblock.blocklist"
 adb_mailservice="/etc/adblock/adblock.mail"
 adb_dnsfile="adb_list.overall"
@@ -1162,6 +1164,134 @@ f_urlhost() {
 	printf '%s\n' "${host}" | f_chkdom local 1
 }
 
+# rebuild a url list option from uci, an entry with whitespace would split into two urls
+#
+f_urllist() {
+	local option="${1}" list=""
+
+	f_urlcb() {
+		case "${1}" in
+		*[[:space:]]*) f_log "info" "${option} entry '${1}' skipped, a url must not contain whitespace" ;;
+		*) list="${list:+${list} }${1}" ;;
+		esac
+	}
+	config_list_foreach "global" "${option}" f_urlcb
+	eval "${option}=\"\${list}\""
+}
+
+# accept https urls, plain http only with 'adb_fetchinsecure'
+#
+f_urlchk() {
+	case "${1}" in
+	"https://"*) return 0 ;;
+	"http://"*) [ "${adb_fetchinsecure}" = "1" ] && return 0 ;;
+	esac
+	f_log "info" "remote list '${1}' skipped, it needs an https url (http only with 'adb_fetchinsecure')"
+	return 1
+}
+
+# file name safe identifier: readable url tail plus a hash of the full url, so urls that differ only in punctuation or scheme get distinct ids
+#
+f_urlid() {
+	printf '%s' "${1}" | "${adb_awkcmd}" 'BEGIN{for (n = 33; n < 127; n++) cs = cs sprintf("%c", n)} {h = 5381; for (i = 1; i <= length($0); i++) h = (h * 33 + index(cs, substr($0, i, 1))) % 4294967296; s = $0; sub(/^[^:]*:\/\//, "", s); gsub(/[^a-zA-Z0-9]/, "_", s); print (length(s) > 80 ? substr(s, length(s) - 79) : s) "_" h}'
+}
+
+# download and validate the remote allowlists, print the accepted domains
+#
+f_allowurl() {
+	local url id key file backup use_backup out_rc cnt keep reason
+	local deny="${adb_tmpdir}/tmp.allow.deny" cap="262144"
+	# public suffixes that would allow whole shared-hosting namespaces
+	local suffixes="co.uk org.uk ac.uk gov.uk com.au net.au org.au co.jp co.nz co.in com.br com.cn github.io gitlab.io herokuapp.com blogspot.com appspot.com cloudfront.net amazonaws.com azurewebsites.net workers.dev pages.dev netlify.app vercel.app"
+
+	f_urllist adb_allowurl
+	adb_allowkeys=""
+	: >"${deny}"
+	[ -f "${adb_blocklist}" ] && f_chkdom local 1 <"${adb_blocklist}" >"${deny}"
+
+	for url in ${adb_allowurl}; do
+		f_urlchk "${url}" || continue
+		id="$(f_urlid "${url}")"
+		key="allow.${id}"
+		file="${adb_tmpdir}/tmp.${key}"
+		backup="${adb_backupdir}/adb_${key}.gz"
+		adb_allowkeys="${adb_allowkeys} ${key}"
+		use_backup="0"
+		out_rc="4"
+		reason="no reason recorded"
+
+		case "${adb_action}" in
+		"boot" | "start" | "restart" | "resume")
+			[ -s "${backup}" ] && use_backup="1"
+			;;
+		"reload")
+			f_etag "${key}" "${url}" && [ -s "${backup}" ] && use_backup="1"
+			;;
+		esac
+
+		if [ "${use_backup}" = "1" ] && "${adb_zcatcmd}" "${backup}" >"${file}" 2>>"${adb_errorlog}"; then
+			out_rc="0"
+		else
+			"${adb_fetchcmd}" ${adb_fetchparm} "${file}.load" "${url}" 2>>"${adb_errorlog}"
+			out_rc="${?}"
+			if [ "${out_rc}" = "0" ] && "${adb_awkcmd}" -v cap="${cap}" '{n += length($0) + 1} END{exit n > cap}' "${file}.load"; then
+				# f_chkdom accepts single labels, so drop them here together with the shared suffixes
+				f_chkdom allow 1 <"${file}.load" |
+					"${adb_awkcmd}" -v sfx="${suffixes}" 'BEGIN{n = split(sfx, s, " "); for (i = 1; i <= n; i++) bad[s[i]]} index($0, ".") && !($0 in bad)' |
+					"${adb_sortcmd}" ${adb_srtopts} -u >"${file}" 2>>"${adb_errorlog}"
+				cnt="$("${adb_awkcmd}" 'END{print NR}' "${file}")"
+				if [ "${cnt}" = "0" ]; then
+					reason="no valid domains"
+					out_rc="4"
+				elif ! "${adb_gzipcmd}" -cf "${file}" 2>>"${adb_errorlog}" >"${backup}.tmp" || ! "${adb_mvcmd}" -f "${backup}.tmp" "${backup}" 2>>"${adb_errorlog}"; then
+					# the validated list stays in use, only the backup is missing
+					"${adb_rmcmd}" -f "${backup}.tmp"
+					f_log "info" "remote allowlist '${url}' backup failed, using the download without a backup"
+				fi
+				[ "${out_rc}" = "0" ] && [ "${cnt}" -gt "100" ] && f_log "warn" "remote allowlist '${url}' holds ${cnt} domains, a large allowlist weakens blocking"
+			elif [ "${out_rc}" = "0" ]; then
+				reason="download larger than ${cap} bytes"
+				out_rc="4"
+			else
+				reason="download failed, rc: ${out_rc}"
+			fi
+			"${adb_rmcmd}" -f "${file}.load"
+		fi
+
+		if [ "${out_rc}" != "0" ]; then
+			[ "${adb_action}" = "reload" ] && f_etag "${key}" "" "" "" "1"
+			: >"${file}"
+			if [ -s "${backup}" ] && "${adb_zcatcmd}" "${backup}" >"${file}" 2>>"${adb_errorlog}"; then
+				f_log "info" "remote allowlist '${url}' not updated (${reason}), using the last good copy"
+			else
+				f_log "info" "remote allowlist '${url}' not available (${reason}), skipped"
+				continue
+			fi
+		fi
+
+		if [ -s "${deny}" ]; then
+			"${adb_awkcmd}" '
+				NR == FNR { deny[$1]; next }
+				{
+					d = $1
+					while (1) {
+						if (d in deny) next
+						i = index(d, ".")
+						if (!i) break
+						d = substr(d, i + 1)
+					}
+					print $1
+				}
+			' "${deny}" "${file}" >"${file}.keep"
+			"${adb_mvcmd}" -f "${file}.keep" "${file}"
+		fi
+		"${adb_catcmd}" "${file}"
+		f_urlhost "${url}"
+		keep="$("${adb_awkcmd}" 'END{print NR}' "${file}")"
+		f_log "debug" "f_allowurl ::: url: ${url}, entries: ${keep}, use_backup: ${use_backup}"
+	done
+}
+
 # backup/restore/remove blocklists
 #
 f_list() {
@@ -1202,10 +1332,12 @@ f_list() {
 			fi
 			;;
 		"allowlist")
-			if [ -f "${adb_allowlist}" ] && [ "${adb_dnsallow}" = "1" ]; then
+			if { [ -f "${adb_allowlist}" ] || [ -n "${adb_allowurl}" ]; } && [ "${adb_dnsallow}" = "1" ]; then
 				file_name="${adb_tmpdir}/tmp.raw.${src_name}"
 				[ "${adb_lookupdomain}" != "localhost" ] && { printf '%s\n' "${adb_lookupdomain}" | f_chkdom allow 1; } >"${file_name}"
-				f_chkdom allow 1 <"${adb_allowlist}" >>"${file_name}"
+				[ -f "${adb_allowlist}" ] && f_chkdom allow 1 <"${adb_allowlist}" >>"${file_name}"
+				# no pipe here, f_allowurl sets adb_allowkeys and must run in the current shell
+				[ -n "${adb_allowurl}" ] && f_allowurl >>"${file_name}"
 				"${adb_catcmd}" "${file_name}" >"${adb_tmpdir}/tmp.rem.${src_name}"
 				f_dnsallow "${file_name}" >"${adb_tmpdir}/tmp.add.${src_name}"
 				out_rc="${?}"
@@ -1371,6 +1503,9 @@ f_list() {
 		files=""
 		for file in ${adb_feed}; do
 			files="${files} ! -name adb_list.${file}.gz"
+		done
+		for file in ${adb_allowkeys}; do
+			files="${files} ! -name adb_${file}.gz"
 		done
 		if [ "${adb_safesearch}" = "1" ] && [ "${adb_dnssafesearch}" = "1" ]; then
 			files="${files} ! -name safesearch.google.gz"
@@ -2138,7 +2273,7 @@ f_main() {
 
 	# drop orphaned etag entries for feeds no longer in the active feed list
 	#
-	[ "${adb_action}" = "reload" ] && f_etag "${adb_feed}" "" "" "" "sweep"
+	[ "${adb_action}" = "reload" ] && f_etag "${adb_feed} ${adb_allowkeys}" "" "" "" "sweep"
 
 	# tld compression and dns restart
 	#
