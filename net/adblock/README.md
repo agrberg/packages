@@ -203,6 +203,7 @@ The `report` sub-command accepts an output mode: `cli` (default, human-readable 
 | adb_repchunksize     | 1                                  | report chunk size used by tcpdump in MB                                                            |
 | adb_represolve       | 0, disabled                        | resolve reporting IP addresses using reverse DNS (PTR) lookups                                     |
 | adb_tld              | 1, enabled                         | set to 0 to disable the top level domain compression (tld) function                                |
+| adb_allowurl         | -, not set                         | list of HTTPS URLs of remote allowlists, see "Subscribe to remote allowlists"                      |
 | adb_basedir          | /tmp                               | path for all adblock related runtime operations, e.g. downloading, sorting, merging etc.           |
 | adb_backupdir        | /tmp/adblock-backup                | path for adblock backups                                                                           |
 | adb_safesearch       | 0, disabled                        | enforce SafeSearch for google, bing, brave, duckduckgo, yandex, youtube and pixabay                |
@@ -535,6 +536,28 @@ Examples:
 The feeds marked `VAR` in the feed table (`hagezi`, `ipfire_dbl`, `stevenblack`, `utcapitole`) are built-in feeds that require an additional category selection via the dedicated options `adb_hag_feed`, `adb_ipf_feed`, `adb_stb_feed` and `adb_utc_feed` (or the LuCI feed configuration). For these, the `url` is a **base URL** to which the selected category is appended at download time. This category mechanism is wired to those specific feed names in the backend, so it cannot be reused for arbitrary new feeds — a custom feed you add yourself should point `url` at a single, complete list URL.
 
 After editing `/etc/adblock/adblock.custom.feeds`, reload adblock (`/etc/init.d/adblock reload`) and check the `Log View` tab (or `logread -e adblock-`). With `adb_debug` enabled, a malformed JSON object or a wrong column/separator typically shows up there as a feed that produces zero domains.
+
+**Subscribe to remote allowlists**  
+Besides the local allowlist, adblock can download allowlists from HTTPS URLs, for example a per-service list that unblocks the hosts a work tool needs. Add the URLs to the `adb_allowurl` list and reload adblock:
+```
+uci add_list adblock.global.adb_allowurl='https://raw.githubusercontent.com/<user>/<repo>/<commit-sha>/services/example.txt'
+uci add_list adblock.global.adb_allowurl='https://raw.githubusercontent.com/<user>/<repo>/<commit-sha>/services/other.txt'
+uci commit adblock
+/etc/init.d/adblock reload
+```
+A remote allowlist is a plain text file with one domain per line. Lines starting with `#`, empty lines and everything that is not a plain domain (wildcards, IP addresses, hosts-file lines) are ignored. Remote entries behave like entries of the local allowlist, so `adb_tld`, jail mode and all DNS backends handle them the same way. They need a DNS backend with allowlist support, which is not the case for the `raw` backend.
+
+A remote list is only accepted if it is small and sane, otherwise adblock keeps using the last good copy and logs the reason:
+* only `https://` URLs are used, `http://` URLs need `adb_fetchinsecure`, which also turns off the certificate check for every other download
+* the download must not exceed 256 KB (checked after the download finished, so it does not limit what is fetched) and must contain at least one valid domain
+* entries without a dot (e.g. `com`) and a short list of shared-hosting suffixes (e.g. `co.uk`, `github.io`) are dropped
+* entries that equal a domain of the local blocklist, or are a subdomain of one, are dropped. A parent domain of a blocklist entry is kept. As for the local allowlist, it removes the blocklist entries below it from the final list when `adb_tld` is enabled (the default). With `adb_tld=0` they stay blocked
+* a list with more than 100 valid domains is still used, but adblock logs a warning because every allowed domain weakens blocking
+* the host of every URL is allowed automatically, as it is for blocklist feeds, even if your own blocklist contains it
+
+The last good copy lives in the backup directory (`/tmp/adblock-backup` by default), so it does not survive a reboot unless `adb_backupdir` points to persistent storage. Without a copy, an unreachable URL is skipped.
+
+**Please note:** whoever controls the URL decides which domains are unblocked, on every router that subscribes to it. Only use lists you trust and pin the URL to a commit (the `<commit-sha>` in the example) so that the content cannot change without your consent. In jail mode the remote lists also decide which domains are reachable at all.
 
 <a id="troubleshooting-and-debug-options"></a>
 ## Troubleshooting & debug options
