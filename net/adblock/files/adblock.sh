@@ -58,6 +58,7 @@ adb_pidfile="${adb_rundir}/adblock.pid"
 adb_rtfile="${adb_rundir}/adblock.runtime.json"
 adb_etaglock="${adb_rundir}/adblock.etag.lock"
 adb_allowlist="/etc/adblock/adblock.allowlist"
+adb_blockurl=""
 adb_allowurl=""
 adb_allowkeys=""
 adb_blocklist="/etc/adblock/adblock.blocklist"
@@ -1196,6 +1197,29 @@ f_urlid() {
 	printf '%s' "${1}" | "${adb_awkcmd}" 'BEGIN{for (n = 33; n < 127; n++) cs = cs sprintf("%c", n)} {h = 5381; for (i = 1; i <= length($0); i++) h = (h * 33 + index(cs, substr($0, i, 1))) % 4294967296; s = $0; sub(/^[^:]*:\/\//, "", s); gsub(/[^a-zA-Z0-9]/, "_", s); print (length(s) > 80 ? substr(s, length(s) - 79) : s) "_" h}'
 }
 
+# add the 'adb_blockurl' urls as feeds, whichever feed file is loaded
+#
+f_blockurl() {
+	local url name
+
+	f_urllist adb_blockurl
+	for url in ${adb_blockurl}; do
+		f_urlchk "${url}" || continue
+		name="blockurl_$(f_urlid "${url}")"
+		case " ${adb_feed} " in
+		*" ${name} "*) continue ;;
+		esac
+		json_add_object "${name}"
+		json_add_string "url" "${url}"
+		json_add_string "rule" "feed 1"
+		json_add_string "size" "-"
+		json_add_string "descr" "custom url"
+		json_close_object
+		adb_feed="${adb_feed} ${name}"
+	done
+	adb_feed="${adb_feed# }"
+}
+
 # download and validate the remote allowlists, print the accepted domains
 #
 f_allowurl() {
@@ -2084,6 +2108,7 @@ f_main() {
 
 	# loop through feeds defined in configuration and process them
 	#
+	[ -n "${adb_blockurl}" ] && f_blockurl
 	for src_name in ${adb_feed}; do
 
 		# check if feed is defined in configuration, if not remove it from feed list and continue with next one

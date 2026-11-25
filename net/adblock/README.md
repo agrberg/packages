@@ -203,6 +203,7 @@ The `report` sub-command accepts an output mode: `cli` (default, human-readable 
 | adb_repchunksize     | 1                                  | report chunk size used by tcpdump in MB                                                            |
 | adb_represolve       | 0, disabled                        | resolve reporting IP addresses using reverse DNS (PTR) lookups                                     |
 | adb_tld              | 1, enabled                         | set to 0 to disable the top level domain compression (tld) function                                |
+| adb_blockurl         | -, not set                         | list of HTTPS URLs of extra blocklists, see "Add your own blocklist URLs"                          |
 | adb_allowurl         | -, not set                         | list of HTTPS URLs of remote allowlists, see "Subscribe to remote allowlists"                      |
 | adb_basedir          | /tmp                               | path for all adblock related runtime operations, e.g. downloading, sorting, merging etc.           |
 | adb_backupdir        | /tmp/adblock-backup                | path for adblock backups                                                                           |
@@ -558,6 +559,16 @@ A remote list is only accepted if it is small and sane, otherwise adblock keeps 
 The last good copy lives in the backup directory (`/tmp/adblock-backup` by default), so it does not survive a reboot unless `adb_backupdir` points to persistent storage. Without a copy, an unreachable URL is skipped.
 
 **Please note:** whoever controls the URL decides which domains are unblocked, on every router that subscribes to it. Only use lists you trust and pin the URL to a commit (the `<commit-sha>` in the example) so that the content cannot change without your consent. In jail mode the remote lists also decide which domains are reachable at all.
+
+**Add your own blocklist URLs**  
+To block one more list in addition to the selected feeds, add its URL to `adb_blockurl` and reload adblock. This works with the shipped feed file and with a custom feed file, and it does not replace any feed:
+```
+uci add_list adblock.global.adb_blockurl='https://example.com/blocklist.txt'
+uci add_list adblock.global.adb_blockurl='https://example.com/other-blocklist.txt'
+uci commit adblock
+/etc/init.d/adblock reload
+```
+The list must be a plain text file with one domain per line. Each URL is handled like a feed with the rule `feed 1`, including etag checks, backups and the automatic allowlisting of the download host. Sources in other formats, e.g. hosts files, still need an entry in the custom feed file with a matching `rule`. The URLs appear as `blockurl_...` in the list of active feeds. As for every feed, an allowlist entry that is a parent of a listed domain removes that domain from the final list when `adb_tld` is enabled (the default). With `adb_tld=0` it stays blocked.
 
 <a id="troubleshooting-and-debug-options"></a>
 ## Troubleshooting & debug options
